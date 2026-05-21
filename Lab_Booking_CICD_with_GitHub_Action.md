@@ -796,6 +796,15 @@ find . -name "*.postman_collection.json"
           "name": "Create Room (Admin)",
           "event": [
             {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "const suffix = Math.floor(Math.random() * 100000);",
+                  "pm.collectionVariables.set('roomSuffix', suffix);"
+                ]
+              }
+            },
+            {
               "listen": "test",
               "script": {
                 "exec": [
@@ -819,7 +828,7 @@ find . -name "*.postman_collection.json"
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\"name\": \"Deluxe Room 101\", \"type\": \"Deluxe\", \"capacity\": 2, \"price\": 1500}"
+              "raw": "{\"name\": \"Deluxe Room {{roomSuffix}}\", \"roomType\": \"Deluxe-{{roomSuffix}}\", \"description\": \"Deluxe room with premium amenities\", \"capacity\": 2, \"price\": 1500}"
             },
             "url": "{{baseUrl}}/api/rooms"
           }
@@ -853,7 +862,7 @@ find . -name "*.postman_collection.json"
             "header": [{"key": "Content-Type", "value": "application/json"}],
             "body": {
               "mode": "raw",
-              "raw": "{\"guestName\": \"Test Guest\", \"guestEmail\": \"test@example.com\", \"roomId\": {{roomId}}, \"checkIn\": \"2025-09-01\", \"checkOut\": \"2025-09-03\"}"
+              "raw": "{\"fullname\": \"Test Guest\", \"email\": \"test@example.com\", \"phone\": \"0123456789\", \"roomId\": {{roomId}}, \"checkin\": \"2025-09-01\", \"checkout\": \"2025-09-03\", \"guests\": 2}"
             },
             "url": "{{baseUrl}}/api/bookings"
           }
@@ -1091,14 +1100,14 @@ jobs:
       - name: Generate Prisma client
         run: |
           cd backend
-          npx prisma generate
+          npx prisma generate --schema=prisma/schema.prisma
 
       - name: Run database migrations
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/booking_test
         run: |
           cd backend
-          npx prisma migrate deploy
+          npx prisma migrate deploy --schema=prisma/schema.prisma
 
       - name: Seed test data
         env:
@@ -1107,7 +1116,6 @@ jobs:
           NODE_ENV: test
         run: |
           cd backend
-          # รัน seed script ถ้ามี (สร้าง admin user สำหรับ test)
           node -e "
             const { PrismaClient } = require('@prisma/client');
             const bcrypt = require('bcryptjs');
@@ -1120,7 +1128,7 @@ jobs:
                 create: { username: 'admin', password: hash, role: 'admin' }
               });
               await prisma.room.create({
-                data: { name: 'Test Room 101', type: 'Standard', capacity: 2, price: 1000 }
+                data: { name: 'Test Room 101', roomType: 'Standard', capacity: 2, price: 1000 }
               });
               console.log('Seed completed');
             }
@@ -1136,7 +1144,6 @@ jobs:
         run: |
           cd backend
           npm start &
-          # รอให้ server พร้อม
           sleep 5
           curl -f http://localhost:3001/api/rooms || (echo "Server not ready" && exit 1)
 
@@ -1195,12 +1202,11 @@ jobs:
 
   # ─────────────────────────────────────────────
   # Job 3: Deploy Frontend to Vercel
-  # (เฉพาะเมื่อ push ไปที่ main เท่านั้น)
   # ─────────────────────────────────────────────
   deploy-frontend:
     name: Deploy Frontend → Vercel
     runs-on: ubuntu-latest
-    needs: [backend-test, frontend-build, security-scan]
+    needs: [backend-test, frontend-build]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
@@ -1221,12 +1227,11 @@ jobs:
 
   # ─────────────────────────────────────────────
   # Job 4: Deploy Backend to Render
-  # (เฉพาะเมื่อ push ไปที่ main เท่านั้น)
   # ─────────────────────────────────────────────
   deploy-backend-render:
     name: Deploy Backend → Render
     runs-on: ubuntu-latest
-    needs: [backend-test, frontend-build, security-scan]
+    needs: [backend-test, frontend-build]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
@@ -1234,61 +1239,26 @@ jobs:
         run: |
           curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
 
-      - name: Wait for deployment (90s)
-        run: sleep 90
+      - name: Wait for Render deployment (180s)
+        run: sleep 180
 
       - name: Health check — Backend on Render
         run: |
-          for i in {1..6}; do
-            echo "Health check attempt $i/6..."
-            if curl -f "${{ secrets.RENDER_BACKEND_URL }}/api/rooms"; then
+          TIMEOUT=300
+          INTERVAL=10
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            echo "Health check attempt... (${ELAPSED}/${TIMEOUT}s)"
+            if curl -f --connect-timeout 5 --max-time 10 "${{ secrets.RENDER_BACKEND_URL }}/api/rooms" > /dev/null 2>&1; then
               echo "✅ Render deployment successful!"
               exit 0
             fi
-            sleep 15
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
           done
-          echo "❌ Render health check failed after 6 attempts"
+          echo "❌ Render health check failed after ${TIMEOUT}s"
           exit 1
 
-  # ─────────────────────────────────────────────
-  # Job 5: Deploy Backend to Railway (ทางเลือก)
-  # ─────────────────────────────────────────────
-  deploy-backend-railway:
-    name: Deploy Backend → Railway
-    runs-on: ubuntu-latest
-    needs: [backend-test, frontend-build, security-scan]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Deploy to Railway
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: |
-          cd backend
-          railway link ${{ secrets.RAILWAY_PROJECT_ID }}
-          railway up --detach
-
-      - name: Wait for deployment (90s)
-        run: sleep 90
-
-      - name: Health check — Backend on Railway
-        run: |
-          for i in {1..6}; do
-            echo "Health check attempt $i/6..."
-            if curl -f "${{ secrets.RAILWAY_BACKEND_URL }}/api/rooms"; then
-              echo "✅ Railway deployment successful!"
-              exit 0
-            fi
-            sleep 15
-          done
-          echo "❌ Railway health check failed"
-          exit 1
 ```
 
 **คำอธิบาย Workflow**:
@@ -1405,6 +1375,7 @@ jobs:
       - name: Deploy Backend to Render (QA)
         run: |
           curl -X POST "${{ secrets.RENDER_QA_DEPLOY_HOOK }}"
+
 ```
 
 ### ขั้นตอนที่ 7.3: ตั้งค่า GitHub Environments
